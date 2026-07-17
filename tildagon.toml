@@ -17,7 +17,7 @@ url = "https://www.github.com/matthewwilkes/advanced-leds"
 # Description of your app.  Maximum 140 characters!
 description = "Drive the badge ring and hexpansion neopixels as one string, laid out as they sit on the badge, with any pattern you have installed"
 
-version = "0.0.1"
+version = "1.0.0"
 
 # Hexpansion neopixels enhance this app but are not needed: the badge's own
 # front ring works on its own, so both capabilities are supported, not required.
