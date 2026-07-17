@@ -39,6 +39,13 @@ builtin_pattern_classes = {
     "off": OffPattern,
 }
 
+# The firmware disagrees with itself about how a pattern exports its class: the
+# PatternDisplay engine reads __pattern_export__, while the app store catalogue
+# reads __Pattern_Export__. Patterns are meant to define both, but plenty define
+# only one, so take whichever is there. PatternDisplay's name comes first, so a
+# pattern defining both behaves here exactly as it does on the badge ring.
+PATTERN_EXPORTS = ["__pattern_export__", "__Pattern_Export__"]
+
 led_orderings = ["Sequential", "Parallel"]
 
 # The front ring exposes 12 logical LEDs (physical 1..12 of tildagonos.leds;
@@ -76,8 +83,7 @@ def load_patterns():
 
 def load_pattern_class(name, directory):
     # Built-in patterns are imported directly. User patterns are loaded the way
-    # the firmware's PatternDisplay loads them, from pattern.<directory>.app
-    # with the class exported as __pattern_export__.
+    # the firmware's PatternDisplay loads them, from pattern.<directory>.app.
     if directory is None:
         return builtin_pattern_classes[name]
     path = "{}/{}/app.py".format(PAT_DIR, directory)
@@ -87,9 +93,13 @@ def load_pattern_class(name, directory):
         "pattern.{}.app".format(directory),
         globals(),
         locals(),
-        ["__pattern_export__"],
+        PATTERN_EXPORTS,
     )
-    return getattr(module, "__pattern_export__")
+    for export in PATTERN_EXPORTS:
+        pattern_class = getattr(module, export, None)
+        if pattern_class is not None:
+            return pattern_class
+    raise ValueError("{} exports none of {}".format(path, ", ".join(PATTERN_EXPORTS)))
 
 
 def app_port(led_app):
