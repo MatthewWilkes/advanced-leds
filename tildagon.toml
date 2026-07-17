@@ -1,0 +1,32 @@
+[app]
+# The name of your app as displayed in the menu
+name = "Advanced LEDs"
+
+# The submenu where your app should appear.
+category = "Apps"
+
+[metadata]
+author = "Matthew Wilkes"
+
+# License of your app as an SPDX identifier: <https://spdx.org/licenses/>
+license = "LGPL-3.0-only"
+
+# URL to the repository of your app.
+url = "https://www.github.com/matthewwilkes/advanced-leds"
+
+# Description of your app.  Maximum 140 characters!
+description = "Drive the badge ring and hexpansion neopixels as one string, laid out as they sit on the badge, with any pattern you have installed"
+
+version = "0.0.1"
+
+# Hexpansion neopixels enhance this app but are not needed: the badge's own
+# front ring works on its own, so both capabilities are supported, not required.
+[[metadata.capabilities]]
+required = false
+feature = { type = "Capability", identifier = "https://tildagon.badge.emfcamp.org/capabilities/registry/neopixels/" }
+
+# A superset of the neopixels capability, used to offer a source's LED
+# groupings. Its spec says to always declare the underlying one alongside it.
+[[metadata.capabilities]]
+required = false
+feature = { type = "Capability", identifier = "https://tildagon.badge.emfcamp.org/capabilities/registry/merged_neopixels/" }
