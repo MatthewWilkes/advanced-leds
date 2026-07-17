@@ -1,11 +1,17 @@
 import app
 import asyncio
+import json
 import neopixel
 
 from app_components import Menu, Notification, clear_background, layout
 from app_components.utils import path_isfile
 from events.input import BUTTON_TYPES, ButtonDownEvent
-from firmware_apps.settings_app import PAT_DIR, SettingsApp
+from firmware_apps.settings_app import (
+    BRIGHTNESSES,
+    PAT_DIR,
+    SettingsApp,
+    pct_formatter,
+)
 from system.eventbus import eventbus
 from system.capabilities.utils import get_running_apps_by_capability
 from system.hexpansion.events import (
@@ -56,6 +62,16 @@ FRONT_LED_OFFSET = 1
 HEXPANSION_PORTS = (1, 2, 3, 4, 5, 6)
 # Sources we cannot place on the ring sort after the ones we can.
 UNKNOWN_PORT = 7
+
+# Hexpansions start at full brightness, and dim in the same steps the badge's
+# own pattern brightness setting uses.
+DEFAULT_BRIGHTNESS = 1.0
+
+DEFAULT_PATTERN = "rainbow"
+
+# Settings live at the root of the badge filesystem, beside the firmware's own
+# settings.json.
+STATE_FILE = "/advanced_leds.json"
 
 # The ring is a circle: LED 0 sits just before the port 1 hexpansion and LED 1
 # just after, LED 2 before port 2 and LED 3 after, and so on until LED 11, which
@@ -120,14 +136,24 @@ def app_name(led_app):
         return name
 
 
+def source_key(led_app):
+    # Saved settings are keyed by slot and app class. JSON has no tuple keys, so
+    # the pair is flattened into one string; a class name cannot contain a colon,
+    # so the two halves stay unambiguous. Keying on both means a hexpansion
+    # returning to its old port gets its settings back, while a different
+    # hexpansion in that port starts from the defaults.
+    return "{}:{}".format(app_port(led_app), type(led_app).__name__)
+
+
 class AdvancedLEDs(app.App):
     def __init__(self):
         self.front_control = False
         self.hexpansion_control = [False, False, False, False, False, False, ]
         self.pattern = None
         # The selected pattern class, re-instantiated to fit the combined ring
-        # whenever its length changes.
-        self.pattern_class = RainbowPattern
+        # whenever its length changes, and the name it was chosen by.
+        self.pattern_name = DEFAULT_PATTERN
+        self.pattern_class = builtin_pattern_classes[DEFAULT_PATTERN]
         self.notification = None
         self.current_menu = "main"
         self.menu = None
@@ -136,6 +162,10 @@ class AdvancedLEDs(app.App):
         self.leds_layout = None
         # Selected LED grouping for each merged-neopixel app, keyed by instance.
         self.led_app_group = {}
+        # Brightness for each hexpansion, keyed by port rather than by app so it
+        # survives a hexpansion being unplugged and coming back as a fresh
+        # instance. Ports absent from here run at DEFAULT_BRIGHTNESS.
+        self.led_brightness = {}
         # How the enabled sources are laid out into one combined string.
         self.led_ordering = "Sequential"
         # The combined string driven by the current pattern, rebuilt on change.
@@ -143,12 +173,129 @@ class AdvancedLEDs(app.App):
         # Number of logical LEDs in the combined string (the front ring counts
         # as 12, ignoring its unused trailing LEDs).
         self.combined_length = 0
+        # Saved per-source settings, keyed by source_key. Entries for sources
+        # that are not plugged in are kept as they are, so their settings are
+        # still there when they come back.
+        self.saved_sources = {}
+        # The sources we have already applied saved settings to.
+        self.restored_apps = set()
+        self._restore_state()
         self._rebuild_composed()
         self.set_menu("main")
         eventbus.on_async(ButtonDownEvent, self._leds_button_handler, self)
         # Rebuild the LED list whenever hexpansions come and go.
         eventbus.on_async(HexpansionMountedEvent, self._hexpansion_changed, self)
         eventbus.on_async(HexpansionUnmountedEvent, self._hexpansion_changed, self)
+
+    def _save_state(self):
+        # Refresh the entries for the sources that are here, leaving the rest of
+        # the file alone: a hexpansion that is unplugged right now must not lose
+        # its settings because an unrelated one changed.
+        for led_app in get_running_apps_by_capability(NEOPIXELS_CAPABILITY):
+            entry = {
+                "enabled": getattr(led_app, "led_owner", None) is self,
+                "brightness": self.brightness(app_port(led_app)),
+            }
+            group = self.led_app_group.get(led_app)
+            if group is not None:
+                entry["group"] = group
+            self.saved_sources[source_key(led_app)] = entry
+        state = {
+            "sources": self.saved_sources,
+            "pattern": self.pattern_name,
+            "front": self.front_control,
+            "ordering": self.led_ordering,
+        }
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            # Settings are a convenience; a full or read-only filesystem must
+            # not take the app down with it.
+            print("Could not save settings: %s" % e)
+
+    def _load_state(self):
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        except Exception:
+            # Nothing saved yet, or the file is unreadable: keep the defaults.
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    def _load_saved_sources(self):
+        # Re-read the saved per-source settings. A failed read leaves the ones
+        # already in hand alone, so a transient error cannot wipe the entries
+        # for hexpansions that are not plugged in.
+        sources = self._load_state().get("sources")
+        if isinstance(sources, dict):
+            self.saved_sources = sources
+
+    def _restore_state(self):
+        state = self._load_state()
+        sources = state.get("sources")
+        if isinstance(sources, dict):
+            self.saved_sources = sources
+
+        self.front_control = bool(state.get("front", False))
+        if self.front_control:
+            # Driving the ring ourselves means the firmware's pattern engine has
+            # to let go of it, exactly as toggling the setting by hand would.
+            eventbus.emit(PatternDisable())
+        ordering = state.get("ordering")
+        if ordering in led_orderings:
+            self.led_ordering = ordering
+        self._restore_pattern(state.get("pattern"))
+        self._restore_sources()
+
+    def _restore_sources(self):
+        # Set up any source we have not configured yet, whether it was already
+        # running at startup or has just been plugged in. Sources configured
+        # earlier are left alone: their settings are written out as they change,
+        # so the file holds nothing new for them, and re-applying a grouping
+        # would swap out an LED string that is working perfectly well.
+        running = get_running_apps_by_capability(NEOPIXELS_CAPABILITY)
+        # Forget sources that have gone, rather than hold an unplugged
+        # hexpansion's app object alive forever.
+        self.restored_apps = set(a for a in self.restored_apps if a in running)
+        for led_app in running:
+            if led_app in self.restored_apps:
+                continue
+            self.restored_apps.add(led_app)
+            entry = self.saved_sources.get(source_key(led_app))
+            if isinstance(entry, dict):
+                self._restore_source(led_app, entry)
+
+    def _restore_pattern(self, name):
+        # Patterns are saved by name, so one that has since been uninstalled
+        # simply will not be found, leaving the default in place.
+        if not name:
+            return
+        for pattern_name, directory in load_patterns():
+            if pattern_name != name:
+                continue
+            try:
+                self.pattern_class = load_pattern_class(name, directory)
+                self.pattern_name = name
+            except Exception as e:
+                print("Could not load saved pattern %s: %s" % (name, e))
+            return
+
+    def _restore_source(self, led_app, entry):
+        port = app_port(led_app)
+        brightness = entry.get("brightness")
+        if port is not None and brightness in BRIGHTNESSES:
+            self.led_brightness[port] = brightness
+        group = entry.get("group")
+        if group is not None and group in getattr(led_app, "LED_GROUPS", {}):
+            self.led_app_group[led_app] = group
+            try:
+                led_app.setup_led_group(group)
+            except Exception as e:
+                print("Could not restore grouping %s: %s" % (group, e))
+        # Only claim a source that nothing else is already driving.
+        if entry.get("enabled") and getattr(led_app, "led_owner", None) is None:
+            led_app.led_owner = self
 
     def set_menu(self, menu_name):
         if self.menu is not None:
@@ -187,6 +334,8 @@ class AdvancedLEDs(app.App):
                 self.notification = Notification('"' + name + '" failed to load')
                 self.set_menu("main")
                 return
+            self.pattern_name = name
+            self._save_state()
             # Rebuild the combined string and size the pattern to fit it.
             self._rebuild_composed()
             self.notification = Notification('Pattern set to "' + name + '"!')
@@ -229,6 +378,11 @@ class AdvancedLEDs(app.App):
             # the groupings it defines.
             if led_app in merged_apps:
                 self._add_group_row(items, led_app)
+            # Brightness belongs to the slot, so it is only offered for sources
+            # we can place in one.
+            port = app_port(led_app)
+            if port is not None:
+                self._add_brightness_row(items, led_app, port)
         # How the enabled sources are combined into one string.
         self._add_ordering_row(items)
         self.leds_layout = layout.LinearLayout(items=items)
@@ -253,9 +407,24 @@ class AdvancedLEDs(app.App):
             and getattr(led_app, "leds", None) is not None
         ]
         led_apps.sort(key=lambda led_app: app_port(led_app) or UNKNOWN_PORT)
-        return [
-            (app_port(led_app), led_app.leds, led_app.leds.n) for led_app in led_apps
-        ]
+        sources = []
+        for led_app in led_apps:
+            port = app_port(led_app)
+            string = self._dimmed(led_app.leds, self.brightness(port))
+            sources.append((port, string, string.n))
+        return sources
+
+    def brightness(self, port):
+        return self.led_brightness.get(port, DEFAULT_BRIGHTNESS)
+
+    def _dimmed(self, string, brightness):
+        # Scale a source's own LEDs down to its configured brightness. The
+        # correction wraps only this string, so dimming one hexpansion leaves
+        # the front ring and every other source untouched. One DimCorrection is
+        # shared across the string's LEDs, as they all dim together.
+        return neopixel.CorrectedNeoPixel(
+            string, [neopixel.DimCorrection(brightness)] * string.n
+        )
 
     def _circular_sources(self, sources):
         # Lay the string out as the LEDs physically sit on the badge: the front
@@ -355,6 +524,7 @@ class AdvancedLEDs(app.App):
             eventbus.emit(PatternDisable())
         else:
             eventbus.emit(PatternEnable())
+        self._save_state()
         self._rebuild_composed()
 
     def _add_toggle_row(self, items, label, get_state, set_state):
@@ -390,11 +560,13 @@ class AdvancedLEDs(app.App):
                     # The source is free: claim it for us.
                     led_app.led_owner = self
                     display.value = state_label()
+                    self._save_state()
                     self._rebuild_composed()
                 elif owner is self:
                     # We hold the lease: release it so others can take over.
                     led_app.led_owner = None
                     display.value = state_label()
+                    self._save_state()
                     self._rebuild_composed()
                 else:
                     self.notification = Notification(
@@ -432,8 +604,32 @@ class AdvancedLEDs(app.App):
                 except Exception:
                     pass
                 display.value = name
+                self._save_state()
                 # setup_led_group replaces the app's leds string, so the
                 # combined string must be rebuilt to point at the new one.
+                self._rebuild_composed()
+                return True
+            return False
+
+        items.append(display)
+        items.append(layout.ButtonDisplay("Next", button_handler=_next))
+
+    def _add_brightness_row(self, items, led_app, port):
+        display = layout.DefinitionDisplay(
+            app_name(led_app) + " brightness", pct_formatter(self.brightness(port))
+        )
+
+        async def _next(event):
+            if BUTTON_TYPES["CONFIRM"] in event.button:
+                current = self.brightness(port)
+                idx = BRIGHTNESSES.index(current) + 1 if current in BRIGHTNESSES else 0
+                if idx >= len(BRIGHTNESSES):
+                    idx = 0
+                self.led_brightness[port] = BRIGHTNESSES[idx]
+                display.value = pct_formatter(BRIGHTNESSES[idx])
+                self._save_state()
+                # The correction is baked into the composed string, so it has to
+                # be rebuilt around the new level.
                 self._rebuild_composed()
                 return True
             return False
@@ -451,6 +647,7 @@ class AdvancedLEDs(app.App):
                 )
                 self.led_ordering = led_orderings[idx]
                 display.value = self.led_ordering
+                self._save_state()
                 # The offsets depend on the ordering, so rebuild the string.
                 self._rebuild_composed()
                 return True
@@ -462,8 +659,11 @@ class AdvancedLEDs(app.App):
     async def _hexpansion_changed(self, event):
         # A hexpansion coming or going invalidates the driven array: a removed
         # source must stop being written, and a re-enumerated one comes back as
-        # a fresh instance we no longer own. Rebuild so we only ever drive
-        # sources we currently hold the lease on.
+        # a fresh instance we no longer own. Re-read the file first, so one
+        # plugged in now is set up just as it would have been at startup.
+        self._load_saved_sources()
+        self._restore_sources()
+        # Rebuild so we only ever drive sources we currently hold the lease on.
         self._rebuild_composed()
         # The list is only visible on the LED screen; elsewhere it is rebuilt
         # from scratch when reopened.
